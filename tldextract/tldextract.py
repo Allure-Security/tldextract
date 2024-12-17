@@ -47,7 +47,7 @@ import requests
 
 from .cache import DiskCache, get_cache_dir
 from .remote import lenient_netloc, looks_like_ip, looks_like_ipv6
-from .suffix_list import get_suffix_lists
+from .suffix_list import find_first_response, extract_tlds_from_suffix_list
 
 CACHE_TIMEOUT = os.environ.get("TLDEXTRACT_CACHE_TIMEOUT")
 
@@ -56,6 +56,124 @@ PUBLIC_SUFFIX_LIST_URLS = (
     "https://raw.githubusercontent.com/publicsuffix/list/master/public_suffix_list.dat",
 )
 
+class Trie:
+    """Trie for storing eTLDs with their labels in reverse-order."""
+
+    def __init__(
+        self,
+        matches: dict[str, Trie] | None = None,
+        end: bool = False,
+        is_private: bool = False,
+    ) -> None:
+        """TODO."""
+        self.matches = matches if matches else {}
+        self.end = end
+        self.is_private = is_private
+
+    @staticmethod
+    def create(
+        public_suffixes: Collection[str],
+        private_suffixes: Collection[str] | None = None,
+    ) -> Trie:
+        """Create a Trie from a list of suffixes and return its root node."""
+        root_node = Trie()
+
+        for suffix in public_suffixes:
+            root_node.add_suffix(suffix)
+
+        if private_suffixes is None:
+            private_suffixes = []
+
+        for suffix in private_suffixes:
+            root_node.add_suffix(suffix, True)
+
+        return root_node
+
+    def add_suffix(self, suffix: str, is_private: bool = False) -> None:
+        """Append a suffix's labels to this Trie node."""
+        node = self
+
+        labels = suffix.split(".")
+        labels.reverse()
+
+        for label in labels:
+            if label not in node.matches:
+                node.matches[label] = Trie()
+            node = node.matches[label]
+
+        node.end = True
+        node.is_private = is_private
+
+
+
+class _PublicSuffixListTLDExtractor:
+    """Wrapper around this project's main algo for PSL lookups."""
+
+    def __init__(
+        self,
+        public_tlds: list[str],
+        private_tlds: list[str],
+        extra_tlds: list[str],
+        include_psl_private_domains: bool = False,
+    ):
+        # set the default value
+        self.include_psl_private_domains = include_psl_private_domains
+        self.public_tlds = public_tlds
+        self.private_tlds = private_tlds
+        self.tlds_incl_private = frozenset(public_tlds + private_tlds + extra_tlds)
+        self.tlds_excl_private = frozenset(public_tlds + extra_tlds)
+        self.tlds_incl_private_trie = Trie.create(
+            self.tlds_excl_private, frozenset(private_tlds)
+        )
+        self.tlds_excl_private_trie = Trie.create(self.tlds_excl_private)
+
+    def tlds(self, include_psl_private_domains: bool | None = None) -> frozenset[str]:
+        """Get the currently filtered list of suffixes."""
+        if include_psl_private_domains is None:
+            include_psl_private_domains = self.include_psl_private_domains
+
+        return (
+            self.tlds_incl_private
+            if include_psl_private_domains
+            else self.tlds_excl_private
+        )
+
+    def suffix_index(
+        self, spl: list[str], include_psl_private_domains: bool | None = None
+    ) -> tuple[int, bool]:
+        """Return the index of the first suffix label, and whether it is private.
+
+        Returns len(spl) if no suffix is found.
+        """
+        if include_psl_private_domains is None:
+            include_psl_private_domains = self.include_psl_private_domains
+
+        node = (
+            self.tlds_incl_private_trie
+            if include_psl_private_domains
+            else self.tlds_excl_private_trie
+        )
+        i = len(spl)
+        j = i
+        for label in reversed(spl):
+            decoded_label = _decode_punycode(label)
+            if decoded_label in node.matches:
+                j -= 1
+                node = node.matches[decoded_label]
+                if node.end:
+                    i = j
+                continue
+
+            is_wildcard = "*" in node.matches
+            if is_wildcard:
+                is_wildcard_exception = "!" + decoded_label in node.matches
+                if is_wildcard_exception:
+                    return j, node.matches["*"].is_private
+                return j - 1, node.matches["*"].is_private
+
+            break
+
+        return i, node.is_private
 
 @dataclass(order=True)
 class ExtractResult:
@@ -204,17 +322,29 @@ class TLDExtract:
                 "to obtain data. Please provide a suffix list data, a cache_dir, "
                 "or set `fallback_to_snapshot` to `True`."
             )
-
-        self.include_psl_private_domains = include_psl_private_domains
-        self.extra_suffixes = extra_suffixes
-        self._extractor: _PublicSuffixListTLDExtractor | None = None
-
+    
         self.cache_fetch_timeout = (
             float(cache_fetch_timeout)
             if isinstance(cache_fetch_timeout, str)
             else cache_fetch_timeout
         )
-        self._cache = DiskCache(cache_dir)
+
+        self.include_psl_private_domains = include_psl_private_domains
+        self.extra_suffixes = extra_suffixes
+        # Directly fetch and parse suffix lists, skipping the cache
+        suffix_list_text = find_first_response(
+            cache=DiskCache(None),  # Temporary in-memory-like behavior
+            urls=self.suffix_list_urls,
+            cache_fetch_timeout=self.cache_fetch_timeout,
+            session=None,
+        )
+        public_tlds, private_tlds = extract_tlds_from_suffix_list(suffix_list_text)
+        self._extractor = _PublicSuffixListTLDExtractor(
+            public_tlds=public_tlds,
+            private_tlds=private_tlds,
+            extra_tlds=list(self.extra_suffixes),
+            include_psl_private_domains=self.include_psl_private_domains,
+        )
 
     def __call__(
         self,
@@ -297,16 +427,15 @@ class TLDExtract:
             len(netloc_with_ascii_dots) >= min_num_ipv6_chars
             and netloc_with_ascii_dots[0] == "["
             and netloc_with_ascii_dots[-1] == "]"
-            and looks_like_ipv6(netloc_with_ascii_dots[1:-1])
         ):
-            return ExtractResult("", netloc_with_ascii_dots, "", is_private=False)
+            if looks_like_ipv6(netloc_with_ascii_dots[1:-1]):
+                return ExtractResult("", netloc_with_ascii_dots, "", is_private=False)
 
         labels = netloc_with_ascii_dots.split(".")
 
-        suffix_index, is_private = self._get_tld_extractor(
-            session=session
-        ).suffix_index(labels, include_psl_private_domains=include_psl_private_domains)
-
+        suffix_index, is_private = self._extractor.suffix_index(
+            labels, include_psl_private_domains=include_psl_private_domains
+        )
         num_ipv4_labels = 4
         if suffix_index == len(labels) == num_ipv4_labels and looks_like_ip(
             netloc_with_ascii_dots
@@ -318,109 +447,17 @@ class TLDExtract:
         domain = labels[suffix_index - 1] if suffix_index else ""
         return ExtractResult(subdomain, domain, suffix, is_private)
 
-    def update(
-        self, fetch_now: bool = False, session: requests.Session | None = None
-    ) -> None:
-        """Force fetch the latest suffix list definitions."""
-        self._extractor = None
-        self._cache.clear()
-        if fetch_now:
-            self._get_tld_extractor(session=session)
-
     @property
-    def tlds(self, session: requests.Session | None = None) -> list[str]:
-        """Returns the list of tld's used by default.
+    def tlds(self) -> list[str]:
+        """Returns the list of TLDs used by default.
 
-        This will vary based on `include_psl_private_domains` and `extra_suffixes`
+        This will vary based on `include_psl_private_domains` and `extra_suffixes`.
         """
-        return list(self._get_tld_extractor(session=session).tlds())
+        return list(self._extractor.tlds())
 
-    def _get_tld_extractor(
-        self, session: requests.Session | None = None
-    ) -> _PublicSuffixListTLDExtractor:
-        """Get or compute this object's TLDExtractor.
-
-        Looks up the TLDExtractor in roughly the following order, based on the
-        settings passed to __init__:
-
-        1. Memoized on `self`
-        2. Local system _cache file
-        3. Remote PSL, over HTTP
-        4. Bundled PSL snapshot file
-        """
-        if self._extractor:
-            return self._extractor
-
-        public_tlds, private_tlds = get_suffix_lists(
-            cache=self._cache,
-            urls=self.suffix_list_urls,
-            cache_fetch_timeout=self.cache_fetch_timeout,
-            fallback_to_snapshot=self.fallback_to_snapshot,
-            session=session,
-        )
-
-        if not any([public_tlds, private_tlds, self.extra_suffixes]):
-            raise ValueError("No tlds set. Cannot proceed without tlds.")
-
-        self._extractor = _PublicSuffixListTLDExtractor(
-            public_tlds=public_tlds,
-            private_tlds=private_tlds,
-            extra_tlds=list(self.extra_suffixes),
-            include_psl_private_domains=self.include_psl_private_domains,
-        )
-        return self._extractor
 
 
 TLD_EXTRACTOR = TLDExtract()
-
-
-class Trie:
-    """Trie for storing eTLDs with their labels in reverse-order."""
-
-    def __init__(
-        self,
-        matches: dict[str, Trie] | None = None,
-        end: bool = False,
-        is_private: bool = False,
-    ) -> None:
-        """TODO."""
-        self.matches = matches if matches else {}
-        self.end = end
-        self.is_private = is_private
-
-    @staticmethod
-    def create(
-        public_suffixes: Collection[str],
-        private_suffixes: Collection[str] | None = None,
-    ) -> Trie:
-        """Create a Trie from a list of suffixes and return its root node."""
-        root_node = Trie()
-
-        for suffix in public_suffixes:
-            root_node.add_suffix(suffix)
-
-        if private_suffixes is None:
-            private_suffixes = []
-
-        for suffix in private_suffixes:
-            root_node.add_suffix(suffix, True)
-
-        return root_node
-
-    def add_suffix(self, suffix: str, is_private: bool = False) -> None:
-        """Append a suffix's labels to this Trie node."""
-        node = self
-
-        labels = suffix.split(".")
-        labels.reverse()
-
-        for label in labels:
-            if label not in node.matches:
-                node.matches[label] = Trie()
-            node = node.matches[label]
-
-        node.end = True
-        node.is_private = is_private
 
 
 @wraps(TLD_EXTRACTOR.__call__)
@@ -432,81 +469,6 @@ def extract(  # noqa: D103
     return TLD_EXTRACTOR(
         url, include_psl_private_domains=include_psl_private_domains, session=session
     )
-
-
-@wraps(TLD_EXTRACTOR.update)
-def update(*args, **kwargs):  # type: ignore[no-untyped-def]  # noqa: D103
-    return TLD_EXTRACTOR.update(*args, **kwargs)
-
-
-class _PublicSuffixListTLDExtractor:
-    """Wrapper around this project's main algo for PSL lookups."""
-
-    def __init__(
-        self,
-        public_tlds: list[str],
-        private_tlds: list[str],
-        extra_tlds: list[str],
-        include_psl_private_domains: bool = False,
-    ):
-        # set the default value
-        self.include_psl_private_domains = include_psl_private_domains
-        self.public_tlds = public_tlds
-        self.private_tlds = private_tlds
-        self.tlds_incl_private = frozenset(public_tlds + private_tlds + extra_tlds)
-        self.tlds_excl_private = frozenset(public_tlds + extra_tlds)
-        self.tlds_incl_private_trie = Trie.create(
-            self.tlds_excl_private, frozenset(private_tlds)
-        )
-        self.tlds_excl_private_trie = Trie.create(self.tlds_excl_private)
-
-    def tlds(self, include_psl_private_domains: bool | None = None) -> frozenset[str]:
-        """Get the currently filtered list of suffixes."""
-        if include_psl_private_domains is None:
-            include_psl_private_domains = self.include_psl_private_domains
-
-        return (
-            self.tlds_incl_private
-            if include_psl_private_domains
-            else self.tlds_excl_private
-        )
-
-    def suffix_index(
-        self, spl: list[str], include_psl_private_domains: bool | None = None
-    ) -> tuple[int, bool]:
-        """Return the index of the first suffix label, and whether it is private.
-
-        Returns len(spl) if no suffix is found.
-        """
-        if include_psl_private_domains is None:
-            include_psl_private_domains = self.include_psl_private_domains
-
-        node = (
-            self.tlds_incl_private_trie
-            if include_psl_private_domains
-            else self.tlds_excl_private_trie
-        )
-        i = len(spl)
-        j = i
-        for label in reversed(spl):
-            decoded_label = _decode_punycode(label)
-            if decoded_label in node.matches:
-                j -= 1
-                node = node.matches[decoded_label]
-                if node.end:
-                    i = j
-                continue
-
-            is_wildcard = "*" in node.matches
-            if is_wildcard:
-                is_wildcard_exception = "!" + decoded_label in node.matches
-                if is_wildcard_exception:
-                    return j, node.matches["*"].is_private
-                return j - 1, node.matches["*"].is_private
-
-            break
-
-        return i, node.is_private
 
 
 def _decode_punycode(label: str) -> str:
